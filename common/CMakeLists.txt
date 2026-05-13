@@ -71,6 +71,8 @@ add_library(${TARGET}
     console.h
     debug.cpp
     debug.h
+    dist-comm.cpp
+    dist-comm.h
     download.cpp
     download.h
     fit.cpp
@@ -170,3 +172,7 @@ if (LLAMA_LLGUIDANCE)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
+
+if (WIN32)
+    target_link_libraries(${TARGET} PRIVATE ws2_32)
+endif()
