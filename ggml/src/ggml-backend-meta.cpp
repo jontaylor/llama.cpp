@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -63,8 +65,50 @@ static void ggml_meta_dist_split_bounds(int64_t n, int64_t granularity, int rank
         return;
     }
 
-    int64_t lo = n * rank / world_size;
-    int64_t hi = n * (rank + 1) / world_size;
+    double weight_before = 0.0;
+    double weight_through = 0.0;
+    double weight_total = 0.0;
+    bool weighted = false;
+
+    const char * split = std::getenv("LLAMA_DIST_TP_MODEL_TENSOR_SPLIT");
+    if (split != nullptr && split[0] != '\0') {
+        weighted = true;
+        const char * p = split;
+        for (int i = 0; i < world_size; ++i) {
+            char * end = nullptr;
+            const double weight = std::strtod(p, &end);
+            if (end == p || !std::isfinite(weight) || weight <= 0.0) {
+                weighted = false;
+                break;
+            }
+
+            weight_total += weight;
+            if (i < rank) {
+                weight_before += weight;
+            }
+            if (i <= rank) {
+                weight_through += weight;
+            }
+
+            p = end;
+            while (*p == ' ' || *p == '\t') {
+                ++p;
+            }
+            if (i + 1 < world_size) {
+                if (*p != ',') {
+                    weighted = false;
+                    break;
+                }
+                ++p;
+            } else if (*p != '\0') {
+                weighted = false;
+            }
+        }
+    }
+
+    int64_t lo = weighted ? (int64_t) (n * weight_before / weight_total) : n * rank / world_size;
+    int64_t hi = weighted ? (rank == world_size - 1 ? n : (int64_t) (n * weight_through / weight_total))
+                          : n * (rank + 1) / world_size;
 
     const int64_t g = std::max<int64_t>(1, granularity);
     if (g > 1) {
@@ -2158,6 +2202,44 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    using dist_profile_clock = std::chrono::steady_clock;
+    struct dist_profile_stats {
+        uint64_t graphs = 0;
+        uint64_t graph_us = 0;
+        uint64_t sync_wait_us = 0;
+        uint64_t d2h_us = 0;
+        uint64_t convert_us = 0;
+        uint64_t network_us = 0;
+        uint64_t h2d_us = 0;
+        uint64_t reduce_submit_us = 0;
+        uint64_t boundaries = 0;
+        uint64_t exchanges = 0;
+        uint64_t tx_bytes = 0;
+        uint64_t rx_bytes = 0;
+    };
+    static const bool dist_profile_enabled = []() {
+        const char * value = std::getenv("GGML_DIST_TP_PROFILE");
+        return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+    }();
+    static const uint64_t dist_profile_interval = []() {
+        const char * value = std::getenv("GGML_DIST_TP_PROFILE_INTERVAL");
+        if (value == nullptr || value[0] == '\0') {
+            return uint64_t(16);
+        }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed > 0 ? (uint64_t) parsed : uint64_t(16);
+    }();
+    thread_local dist_profile_stats dist_profile;
+    const auto dist_profile_graph_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
+    auto dist_profile_elapsed_us = [](const dist_profile_clock::time_point & start) -> uint64_t {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(dist_profile_clock::now() - start).count();
+    };
+    int dist_profile_rank = 0;
+    int dist_profile_world = 1;
+    if (dist_profile_enabled) {
+        ggml_meta_dist_rank_world(backend_ctx->dist_cfg, &dist_profile_rank, &dist_profile_world);
+    }
+
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
@@ -2644,31 +2726,65 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (nbytes_dst != n * sizeof(float)) {
                         continue;
                     }
+                    const auto d2h_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     ggml_backend_tensor_get(node_dst, cur.data(), 0, nbytes_dst);
+                    if (dist_profile_enabled) {
+                        dist_profile.d2h_us += dist_profile_elapsed_us(d2h_start);
+                    }
                 } else {
                     cur_f16.resize(n);
                     if (nbytes_dst != n * sizeof(ggml_fp16_t)) {
                         continue;
                     }
+                    const auto d2h_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     ggml_backend_tensor_get(node_dst, cur_f16.data(), 0, nbytes_dst);
+                    if (dist_profile_enabled) {
+                        dist_profile.d2h_us += dist_profile_elapsed_us(d2h_start);
+                    }
+                    const auto convert_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     ggml_fp16_to_fp32_row(cur_f16.data(), cur.data(), n);
+                    if (dist_profile_enabled) {
+                        dist_profile.convert_us += dist_profile_elapsed_us(convert_start);
+                    }
+                }
+                if (dist_profile_enabled) {
+                    dist_profile.boundaries++;
                 }
 
                 int32_t cur_src = dist_rank;
                 for (int step = 0; step < dist_world_size - 1; ++step) {
                     int32_t recv_src = -1;
+                    const auto network_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     if (!backend_ctx->dist_comm_allreduce(backend_ctx->dist_comm_ctx, cur.data(), n, cur_src, recv.data(), &recv_src)) {
                         return GGML_STATUS_FAILED;
+                    }
+                    if (dist_profile_enabled) {
+                        dist_profile.network_us += dist_profile_elapsed_us(network_start);
+                        dist_profile.exchanges++;
+                        dist_profile.tx_bytes += n * sizeof(float);
+                        dist_profile.rx_bytes += n * sizeof(float);
                     }
 
                     ggml_tensor * node_tmp = get_node_aux(node_dst);
                     set_tmp_data(node_tmp, j, i_buf);
                     if (is_f32) {
+                        const auto h2d_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                         ggml_backend_tensor_set(node_tmp, recv.data(), 0, n * sizeof(float));
+                        if (dist_profile_enabled) {
+                            dist_profile.h2d_us += dist_profile_elapsed_us(h2d_start);
+                        }
                     } else {
                         recv_f16.resize(n);
+                        const auto convert_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                         ggml_fp32_to_fp16_row(recv.data(), recv_f16.data(), n);
+                        if (dist_profile_enabled) {
+                            dist_profile.convert_us += dist_profile_elapsed_us(convert_start);
+                        }
+                        const auto h2d_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                         ggml_backend_tensor_set(node_tmp, recv_f16.data(), 0, n * sizeof(ggml_fp16_t));
+                        if (dist_profile_enabled) {
+                            dist_profile.h2d_us += dist_profile_elapsed_us(h2d_start);
+                        }
                     }
 
                     ggml_tensor * node_red = get_node_aux(node_dst);
@@ -2684,7 +2800,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     cgraph_aux->nodes[0] = node_red;
                     cgraph_aux->n_nodes = 1;
 
+                    const auto reduce_submit_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_aux);
+                    if (dist_profile_enabled) {
+                        dist_profile.reduce_submit_us += dist_profile_elapsed_us(reduce_submit_start);
+                    }
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
                     }
@@ -2757,8 +2877,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (has_dist_boundary) {
                     // graph_compute_async() may leave boundary tensors in-flight on the backend.
                     // The distributed fallback reads and writes boundary tensors directly.
+                    const auto sync_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     for (size_t j = 0; j < n_backends; j++) {
                         ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                    }
+                    if (dist_profile_enabled) {
+                        dist_profile.sync_wait_us += dist_profile_elapsed_us(sync_start);
                     }
 
                     const ggml_status status = dist_allreduce_fallback(nodes_dist_per_backend);
@@ -2767,6 +2891,38 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
             }
+        }
+    }
+    if (dist_profile_enabled) {
+        dist_profile.graphs++;
+        dist_profile.graph_us += dist_profile_elapsed_us(dist_profile_graph_start);
+        if (dist_profile.graphs >= dist_profile_interval) {
+            const double graphs = (double) dist_profile.graphs;
+            const uint64_t measured_us = dist_profile.sync_wait_us + dist_profile.d2h_us + dist_profile.convert_us +
+                dist_profile.network_us + dist_profile.h2d_us + dist_profile.reduce_submit_us;
+            const uint64_t other_us = dist_profile.graph_us > measured_us ? dist_profile.graph_us - measured_us : 0;
+            const double to_ms = 1.0 / (graphs * 1000.0);
+            const double to_kib = 1.0 / (graphs * 1024.0);
+            GGML_LOG_INFO(
+                "[dist-tp-profile][rank=%d/%d] graphs=%llu boundaries=%llu exchanges=%llu "
+                "avg_graph=%.3fms sync_wait=%.3fms d2h=%.3fms convert=%.3fms network=%.3fms "
+                "h2d=%.3fms reduce_submit=%.3fms other=%.3fms tx=%.2fKiB/graph rx=%.2fKiB/graph\n",
+                dist_profile_rank,
+                dist_profile_world,
+                (unsigned long long) dist_profile.graphs,
+                (unsigned long long) dist_profile.boundaries,
+                (unsigned long long) dist_profile.exchanges,
+                dist_profile.graph_us * to_ms,
+                dist_profile.sync_wait_us * to_ms,
+                dist_profile.d2h_us * to_ms,
+                dist_profile.convert_us * to_ms,
+                dist_profile.network_us * to_ms,
+                dist_profile.h2d_us * to_ms,
+                dist_profile.reduce_submit_us * to_ms,
+                other_us * to_ms,
+                dist_profile.tx_bytes * to_kib,
+                dist_profile.rx_bytes * to_kib);
+            dist_profile = {};
         }
     }
     return GGML_STATUS_SUCCESS;
