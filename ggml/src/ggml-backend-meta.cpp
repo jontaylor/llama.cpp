@@ -2229,14 +2229,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const long parsed = std::strtol(value, nullptr, 10);
         return parsed > 0 ? (uint64_t) parsed : uint64_t(16);
     }();
+    static const bool dist_boundary_trace_enabled = []() {
+        const char * value = std::getenv("GGML_DIST_TP_BOUNDARY_TRACE");
+        return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+    }();
+    static const uint64_t dist_boundary_trace_limit = []() {
+        const char * value = std::getenv("GGML_DIST_TP_BOUNDARY_TRACE_LIMIT");
+        if (value == nullptr || value[0] == '\0') {
+            return uint64_t(512);
+        }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed > 0 ? (uint64_t) parsed : uint64_t(512);
+    }();
     thread_local dist_profile_stats dist_profile;
-    const auto dist_profile_graph_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
+    thread_local uint64_t dist_profile_graph_seq = 0;
+    thread_local uint64_t dist_boundary_trace_seq = 0;
+    const auto dist_profile_graph_start = (dist_profile_enabled || dist_boundary_trace_enabled) ?
+        dist_profile_clock::now() : dist_profile_clock::time_point{};
     auto dist_profile_elapsed_us = [](const dist_profile_clock::time_point & start) -> uint64_t {
         return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(dist_profile_clock::now() - start).count();
     };
     int dist_profile_rank = 0;
     int dist_profile_world = 1;
     if (dist_profile_enabled) {
+        ggml_meta_dist_rank_world(backend_ctx->dist_cfg, &dist_profile_rank, &dist_profile_world);
+    }
+    if (dist_boundary_trace_enabled && !dist_profile_enabled) {
         ggml_meta_dist_rank_world(backend_ctx->dist_cfg, &dist_profile_rank, &dist_profile_world);
     }
 
@@ -2549,6 +2567,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return ret;
     };
 
+    struct pending_dist_consumer {
+        uint64_t collective_seq = 0;
+        int node_index = -1;
+        dist_profile_clock::time_point reduced_at {};
+    };
+    std::vector<pending_dist_consumer> pending_consumers;
+
+    auto tensor_refers_to = [](const ggml_tensor * tensor, const ggml_tensor * target) -> bool {
+        for (const ggml_tensor * cur = tensor; cur != nullptr; cur = cur->view_src) {
+            if (cur == target) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto first_consumer_index = [&](const int boundary_index) -> int {
+        const ggml_tensor * boundary = cgraph->nodes[boundary_index];
+        for (int k = boundary_index + 1; k < cgraph->n_nodes; ++k) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (tensor_refers_to(cgraph->nodes[k]->src[s], boundary)) {
+                    return k;
+                }
+            }
+        }
+        return -1;
+    };
+
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
@@ -2823,6 +2869,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const size_t i_node_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
+        const size_t i_node_stop = i + 1 < backend_ctx->n_subgraphs ?
+            backend_ctx->backend_configs[0].cgraphs[i + 1].offset : (size_t) cgraph->n_nodes;
+        for (auto it = pending_consumers.begin(); it != pending_consumers.end();) {
+            if (it->node_index >= (int) i_node_start && it->node_index < (int) i_node_stop) {
+                std::fprintf(stderr,
+                    "[dist-tp-boundary-consume][rank=%d/%d] seq=%llu graph=%llu consumer_index=%d "
+                    "consumer_name=%s consumer_op=%s ready_to_issue_us=%llu\n",
+                    dist_profile_rank,
+                    dist_profile_world,
+                    (unsigned long long) it->collective_seq,
+                    (unsigned long long) dist_profile_graph_seq,
+                    it->node_index,
+                    cgraph->nodes[it->node_index]->name,
+                    ggml_op_name(cgraph->nodes[it->node_index]->op),
+                    (unsigned long long) dist_profile_elapsed_us(it->reduced_at));
+                std::fflush(stderr);
+                it = pending_consumers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -2875,19 +2944,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 if (has_dist_boundary) {
+                    const int boundary_index = (int) backend_ctx->backend_configs[0].cgraphs[i + 1].offset - 1;
+                    ggml_tensor * boundary_node = cgraph->nodes[boundary_index];
+                    const int consumer_index = first_consumer_index(boundary_index);
+                    const uint64_t collective_seq = dist_boundary_trace_seq++;
+                    const bool trace_boundary = dist_boundary_trace_enabled && collective_seq < dist_boundary_trace_limit;
                     // graph_compute_async() may leave boundary tensors in-flight on the backend.
                     // The distributed fallback reads and writes boundary tensors directly.
-                    const auto sync_start = dist_profile_enabled ? dist_profile_clock::now() : dist_profile_clock::time_point{};
+                    const auto sync_start = (dist_profile_enabled || trace_boundary) ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     for (size_t j = 0; j < n_backends; j++) {
                         ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
                     }
+                    const uint64_t boundary_sync_us = (dist_profile_enabled || trace_boundary) ? dist_profile_elapsed_us(sync_start) : 0;
                     if (dist_profile_enabled) {
-                        dist_profile.sync_wait_us += dist_profile_elapsed_us(sync_start);
+                        dist_profile.sync_wait_us += boundary_sync_us;
                     }
 
+                    const auto boundary_reduce_start = trace_boundary ? dist_profile_clock::now() : dist_profile_clock::time_point{};
                     const ggml_status status = dist_allreduce_fallback(nodes_dist_per_backend);
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
+                    }
+                    if (trace_boundary) {
+                        const uint64_t boundary_reduce_us = dist_profile_elapsed_us(boundary_reduce_start);
+                        const char * dash = std::strrchr(boundary_node->name, '-');
+                        const long layer = dash != nullptr ? std::strtol(dash + 1, nullptr, 10) : -1;
+                        std::fprintf(stderr,
+                            "[dist-tp-boundary][rank=%d/%d] seq=%llu graph=%llu subgraph=%zu node_index=%d "
+                            "name=%s op=%s layer=%ld source_bytes=%zu wire_bytes=%zu issue_us=%llu sync_wait_us=%llu reduce_us=%llu "
+                            "first_consumer_index=%d first_consumer_name=%s first_consumer_op=%s data_dependent=%d\n",
+                            dist_profile_rank,
+                            dist_profile_world,
+                            (unsigned long long) collective_seq,
+                            (unsigned long long) dist_profile_graph_seq,
+                            i,
+                            boundary_index,
+                            boundary_node->name,
+                            ggml_op_name(boundary_node->op),
+                            layer,
+                            ggml_nbytes(boundary_node),
+                            (size_t) ggml_nelements(boundary_node) * sizeof(float),
+                            (unsigned long long) dist_profile_elapsed_us(dist_profile_graph_start),
+                            (unsigned long long) boundary_sync_us,
+                            (unsigned long long) boundary_reduce_us,
+                            consumer_index,
+                            consumer_index >= 0 ? cgraph->nodes[consumer_index]->name : "none",
+                            consumer_index >= 0 ? ggml_op_name(cgraph->nodes[consumer_index]->op) : "none",
+                            consumer_index >= 0 ? 1 : 0);
+                        std::fflush(stderr);
+                        if (consumer_index >= 0) {
+                            pending_consumers.push_back({collective_seq, consumer_index, dist_profile_clock::now()});
+                        }
                     }
                 }
             }
@@ -2925,6 +3032,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             dist_profile = {};
         }
     }
+    dist_profile_graph_seq++;
     return GGML_STATUS_SUCCESS;
 }
 

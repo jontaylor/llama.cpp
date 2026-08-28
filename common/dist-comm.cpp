@@ -448,13 +448,35 @@ struct dist_comm_socket_context::impl {
             const long parsed = std::strtol(value, nullptr, 10);
             return parsed > 0 ? (uint64_t) parsed : uint64_t(128);
         }();
+        static const bool boundary_trace_enabled = []() {
+            const char * value = std::getenv("GGML_DIST_TP_BOUNDARY_TRACE");
+            return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+        }();
+        static const uint64_t boundary_trace_limit = []() {
+            const char * value = std::getenv("GGML_DIST_TP_BOUNDARY_TRACE_LIMIT");
+            if (value == nullptr || value[0] == '\0') {
+                return uint64_t(512);
+            }
+            const long parsed = std::strtol(value, nullptr, 10);
+            return parsed > 0 ? (uint64_t) parsed : uint64_t(512);
+        }();
         thread_local transport_profile_stats transport_profile;
-        const bool profile_this = transport_profile_enabled && op == OP_ALLREDUCE_F32;
-        const auto exchange_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
+        thread_local uint64_t boundary_trace_seq = 0;
+        thread_local const auto boundary_trace_epoch = transport_profile_clock::now();
         auto elapsed_us = [](const transport_profile_clock::time_point & start) -> uint64_t {
             return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                 transport_profile_clock::now() - start).count();
         };
+        const bool profile_this = transport_profile_enabled && op == OP_ALLREDUCE_F32;
+        const bool trace_this = boundary_trace_enabled && op == OP_ALLREDUCE_F32 && boundary_trace_seq < boundary_trace_limit;
+        const uint64_t trace_seq = boundary_trace_seq++;
+        const uint64_t trace_issue_us = trace_this ? elapsed_us(boundary_trace_epoch) : 0;
+        const auto exchange_start = (profile_this || trace_this) ? transport_profile_clock::now() : transport_profile_clock::time_point{};
+
+        uint64_t trace_send_hdr_us = 0;
+        uint64_t trace_send_body_us = 0;
+        uint64_t trace_recv_hdr_us = 0;
+        uint64_t trace_recv_body_us = 0;
 
         op_hdr send_hdr {
             op,
@@ -465,8 +487,11 @@ struct dist_comm_socket_context::impl {
         op_hdr recv_hdr {};
 
         auto send_payload = [&]() -> bool {
-            const auto hdr_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
+            const auto hdr_start = (profile_this || trace_this) ? transport_profile_clock::now() : transport_profile_clock::time_point{};
             const bool hdr_ok = write_msg(ring_out_fd, &send_hdr, sizeof(send_hdr), err);
+            if (trace_this) {
+                trace_send_hdr_us += elapsed_us(hdr_start);
+            }
             if (profile_this) {
                 transport_profile.send_hdr_us += elapsed_us(hdr_start);
             }
@@ -475,8 +500,11 @@ struct dist_comm_socket_context::impl {
             }
 
             if (send_size > 0) {
-                const auto body_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
+                const auto body_start = (profile_this || trace_this) ? transport_profile_clock::now() : transport_profile_clock::time_point{};
                 const bool body_ok = write_msg(ring_out_fd, send_data_ptr, send_size, err);
+                if (trace_this) {
+                    trace_send_body_us += elapsed_us(body_start);
+                }
                 if (profile_this) {
                     transport_profile.send_body_us += elapsed_us(body_start);
                 }
@@ -488,8 +516,11 @@ struct dist_comm_socket_context::impl {
         };
 
         auto recv_payload = [&]() -> bool {
-            const auto hdr_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
+            const auto hdr_start = (profile_this || trace_this) ? transport_profile_clock::now() : transport_profile_clock::time_point{};
             const bool hdr_ok = read_msg(ring_in_fd, &recv_hdr, sizeof(recv_hdr), err);
+            if (trace_this) {
+                trace_recv_hdr_us += elapsed_us(hdr_start);
+            }
             if (profile_this) {
                 transport_profile.recv_hdr_us += elapsed_us(hdr_start);
             }
@@ -505,8 +536,11 @@ struct dist_comm_socket_context::impl {
                 return false;
             }
             if (recv_size > 0) {
-                const auto body_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
+                const auto body_start = (profile_this || trace_this) ? transport_profile_clock::now() : transport_profile_clock::time_point{};
                 const bool body_ok = read_msg(ring_in_fd, recv_data_ptr, recv_size, err);
+                if (trace_this) {
+                    trace_recv_body_us += elapsed_us(body_start);
+                }
                 if (profile_this) {
                     transport_profile.recv_body_us += elapsed_us(body_start);
                 }
@@ -560,6 +594,26 @@ struct dist_comm_socket_context::impl {
                 std::fflush(stderr);
                 transport_profile = {};
             }
+        }
+
+        if (trace_this) {
+            std::fprintf(stderr,
+                "[dist-tp-transport-event][rank=%d/%d] seq=%llu issue_us=%llu payload=%zu "
+                "total_us=%llu send_hdr_us=%llu send_body_us=%llu recv_hdr_us=%llu recv_body_us=%llu "
+                "arrival_skew_proxy_us=%llu ok=%d\n",
+                cfg.rank,
+                cfg.world_size,
+                (unsigned long long) trace_seq,
+                (unsigned long long) trace_issue_us,
+                send_size,
+                (unsigned long long) elapsed_us(exchange_start),
+                (unsigned long long) trace_send_hdr_us,
+                (unsigned long long) trace_send_body_us,
+                (unsigned long long) trace_recv_hdr_us,
+                (unsigned long long) trace_recv_body_us,
+                (unsigned long long) trace_recv_hdr_us,
+                ok ? 1 : 0);
+            std::fflush(stderr);
         }
 
         return ok;
