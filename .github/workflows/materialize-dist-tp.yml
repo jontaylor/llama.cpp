@@ -1,0 +1,64 @@
+name: Materialize dist-tp source changes
+
+on:
+  push:
+    branches:
+      - dist-tp-weighted-ranks
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: dist-tp-weighted-ranks
+          fetch-depth: 0
+
+      - name: Materialize source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # This workflow is intentionally one-shot. If the source has already
+          # been materialized, there is nothing left to do.
+          if grep -q 'llama_dist_tp_split_bounds' src/llama-model.cpp \
+             && grep -q 'dist-tp-profile' ggml/src/ggml-backend-meta.cpp \
+             && grep -q 'dist-tp-transport' common/dist-comm.cpp \
+             && grep -q 'TWO_RANK_FULL_DUPLEX_MAX' common/dist-comm.cpp; then
+            echo 'dist-tp source changes are already materialized'
+            exit 0
+          fi
+
+          git apply --recount --check dist-tp-weighted-ranks.patch
+          git apply --recount dist-tp-weighted-ranks.patch
+
+          git apply --recount --check dist-tp-profile.patch
+          git apply --recount dist-tp-profile.patch
+
+          git apply --recount --check dist-tp-transport-profile.patch
+          git apply --recount dist-tp-transport-profile.patch
+
+          git apply --recount --check dist-tp-full-duplex-2rank-profiled.patch
+          git apply --recount dist-tp-full-duplex-2rank-profiled.patch
+
+          git diff --check
+
+          # Remove the scaffolding once the real source files contain the changes.
+          rm -f \
+            dist-tp-weighted-ranks.patch \
+            dist-tp-profile.patch \
+            dist-tp-profile-stderr.patch \
+            dist-tp-transport-profile.patch \
+            dist-tp-full-duplex-2rank.patch \
+            dist-tp-full-duplex-2rank-profiled.patch \
+            .github/workflows/materialize-dist-tp.yml
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'dist-tp: materialize weighted ranks and profiling source changes'
+          git push origin HEAD:dist-tp-weighted-ranks
