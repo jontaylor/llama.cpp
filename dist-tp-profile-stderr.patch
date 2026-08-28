@@ -1,0 +1,28 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -10,6 +10,7 @@
+ #include <cassert>
+ #include <chrono>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstddef>
+ #include <cstdint>
+@@ -2903,7 +2904,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             const uint64_t other_us = dist_profile.graph_us > measured_us ? dist_profile.graph_us - measured_us : 0;
+             const double to_ms = 1.0 / (graphs * 1000.0);
+             const double to_kib = 1.0 / (graphs * 1024.0);
+-            GGML_LOG_INFO(
++            std::fprintf(stderr,
+                 "[dist-tp-profile][rank=%d/%d] graphs=%llu boundaries=%llu exchanges=%llu "
+                 "avg_graph=%.3fms sync_wait=%.3fms d2h=%.3fms convert=%.3fms network=%.3fms "
+                 "h2d=%.3fms reduce_submit=%.3fms other=%.3fms tx=%.2fKiB/graph rx=%.2fKiB/graph\n",
+@@ -2925,6 +2926,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 other_us * to_ms,
+                 dist_profile.tx_bytes * to_kib,
+                 dist_profile.rx_bytes * to_kib);
++            std::fflush(stderr);
+             dist_profile = {};
+         }
+     }
