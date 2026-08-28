@@ -1,0 +1,20 @@
+diff --git a/common/dist-comm.cpp b/common/dist-comm.cpp
+--- a/common/dist-comm.cpp
++++ b/common/dist-comm.cpp
+@@ -459,10 +459,16 @@
+             recv_src_rank = recv_hdr.src_rank;
+             return true;
+         };
+ 
++        // Small two-rank exchanges are safe to enqueue in both directions before either side receives.
++        constexpr size_t TWO_RANK_FULL_DUPLEX_MAX = 64 * 1024;
++        if (cfg.world_size == 2 && send_size <= TWO_RANK_FULL_DUPLEX_MAX && recv_size <= TWO_RANK_FULL_DUPLEX_MAX) {
++            return send_payload() && recv_payload();
++        }
++
+         // Rank parity avoids blocking send/send for large payloads.
+         if ((cfg.rank & 1) == 0) {
+             return send_payload() && recv_payload();
+         }
+         return recv_payload() && send_payload();
+     }
