@@ -1,6 +1,6 @@
 --- a/common/dist-comm.cpp
 +++ b/common/dist-comm.cpp
-@@ -515,11 +515,18 @@
+@@ -515,11 +515,19 @@
          };
  
          bool ok;
