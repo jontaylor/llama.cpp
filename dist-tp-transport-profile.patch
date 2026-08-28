@@ -1,0 +1,140 @@
+--- a/common/dist-comm.cpp
++++ b/common/dist-comm.cpp
+@@ -424,6 +424,37 @@
+ 
+     bool exchange_ring(uint32_t op, int32_t src_rank, const void * send_data_ptr, size_t send_size,
+             int32_t & recv_src_rank, void * recv_data_ptr, size_t recv_size, std::string & err) {
++        using transport_profile_clock = std::chrono::steady_clock;
++        struct transport_profile_stats {
++            uint64_t calls = 0;
++            uint64_t total_us = 0;
++            uint64_t send_hdr_us = 0;
++            uint64_t send_body_us = 0;
++            uint64_t recv_hdr_us = 0;
++            uint64_t recv_body_us = 0;
++            uint64_t send_bytes = 0;
++            uint64_t recv_bytes = 0;
++        };
++        static const bool transport_profile_enabled = []() {
++            const char * value = std::getenv("GGML_DIST_TP_PROFILE");
++            return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
++        }();
++        static const uint64_t transport_profile_interval = []() {
++            const char * value = std::getenv("GGML_DIST_TP_TRANSPORT_PROFILE_INTERVAL");
++            if (value == nullptr || value[0] == '\0') {
++                return uint64_t(128);
++            }
++            const long parsed = std::strtol(value, nullptr, 10);
++            return parsed > 0 ? (uint64_t) parsed : uint64_t(128);
++        }();
++        thread_local transport_profile_stats transport_profile;
++        const bool profile_this = transport_profile_enabled && op == OP_ALLREDUCE_F32;
++        const auto exchange_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
++        auto elapsed_us = [](const transport_profile_clock::time_point & start) -> uint64_t {
++            return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
++                transport_profile_clock::now() - start).count();
++        };
++
+         op_hdr send_hdr {
+             op,
+             static_cast<uint32_t>(send_size),
+@@ -433,17 +464,35 @@
+         op_hdr recv_hdr {};
+ 
+         auto send_payload = [&]() -> bool {
+-            if (!write_msg(ring_out_fd, &send_hdr, sizeof(send_hdr), err)) {
++            const auto hdr_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
++            const bool hdr_ok = write_msg(ring_out_fd, &send_hdr, sizeof(send_hdr), err);
++            if (profile_this) {
++                transport_profile.send_hdr_us += elapsed_us(hdr_start);
++            }
++            if (!hdr_ok) {
+                 return false;
+             }
+-            if (send_size > 0 && !write_msg(ring_out_fd, send_data_ptr, send_size, err)) {
+-                return false;
++
++            if (send_size > 0) {
++                const auto body_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
++                const bool body_ok = write_msg(ring_out_fd, send_data_ptr, send_size, err);
++                if (profile_this) {
++                    transport_profile.send_body_us += elapsed_us(body_start);
++                }
++                if (!body_ok) {
++                    return false;
++                }
+             }
+             return true;
+         };
+ 
+         auto recv_payload = [&]() -> bool {
+-            if (!read_msg(ring_in_fd, &recv_hdr, sizeof(recv_hdr), err)) {
++            const auto hdr_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
++            const bool hdr_ok = read_msg(ring_in_fd, &recv_hdr, sizeof(recv_hdr), err);
++            if (profile_this) {
++                transport_profile.recv_hdr_us += elapsed_us(hdr_start);
++            }
++            if (!hdr_ok) {
+                 return false;
+             }
+             if (recv_hdr.op != op) {
+@@ -454,16 +503,55 @@
+                 err = "unexpected payload size on ring";
+                 return false;
+             }
+-            if (recv_size > 0 && !read_msg(ring_in_fd, recv_data_ptr, recv_size, err)) {
+-                return false;
++            if (recv_size > 0) {
++                const auto body_start = profile_this ? transport_profile_clock::now() : transport_profile_clock::time_point{};
++                const bool body_ok = read_msg(ring_in_fd, recv_data_ptr, recv_size, err);
++                if (profile_this) {
++                    transport_profile.recv_body_us += elapsed_us(body_start);
++                }
++                if (!body_ok) {
++                    return false;
++                }
+             }
+             recv_src_rank = recv_hdr.src_rank;
+             return true;
+         };
+ 
++        bool ok;
+         // Rank parity avoids blocking send/send for large payloads.
+         if ((cfg.rank & 1) == 0) {
+-            return send_payload() && recv_payload();
++            ok = send_payload() && recv_payload();
++        } else {
++            ok = recv_payload() && send_payload();
+         }
+-        return recv_payload() && send_payload();
++
++        if (profile_this) {
++            transport_profile.calls++;
++            transport_profile.total_us += elapsed_us(exchange_start);
++            transport_profile.send_bytes += send_size;
++            transport_profile.recv_bytes += recv_size;
++            if (transport_profile.calls >= transport_profile_interval) {
++                const double calls = (double) transport_profile.calls;
++                const double to_ms = 1.0 / (calls * 1000.0);
++                const double to_kib = 1.0 / (calls * 1024.0);
++                std::fprintf(stderr,
++                    "[dist-tp-transport][rank=%d/%d] calls=%llu avg=%.3fms "
++                    "send_hdr=%.3fms send_body=%.3fms recv_hdr=%.3fms recv_body=%.3fms "
++                    "tx=%.2fKiB/call rx=%.2fKiB/call\n",
++                    cfg.rank,
++                    cfg.world_size,
++                    (unsigned long long) transport_profile.calls,
++                    transport_profile.total_us * to_ms,
++                    transport_profile.send_hdr_us * to_ms,
++                    transport_profile.send_body_us * to_ms,
++                    transport_profile.recv_hdr_us * to_ms,
++                    transport_profile.recv_body_us * to_ms,
++                    transport_profile.send_bytes * to_kib,
++                    transport_profile.recv_bytes * to_kib);
++                std::fflush(stderr);
++                transport_profile = {};
++            }
++        }
++
++        return ok;
+     }
